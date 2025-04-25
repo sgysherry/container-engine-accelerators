@@ -15,14 +15,29 @@
 package healthcheck
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/GoogleCloudPlatform/container-engine-accelerators/pkg/gpu/nvidia/util"
 	"github.com/NVIDIA/gpu-monitoring-tools/bindings/go/nvml"
 	"github.com/golang/glog"
+	v1 "k8s.io/api/core/v1"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+)
+
+const (
+	XIDConditionType = "XidCriticalError"
 )
 
 // GPUHealthChecker checks the health of nvidia GPUs. Note that with the current
@@ -35,16 +50,38 @@ type GPUHealthChecker struct {
 	eventSet          nvml.EventSet
 	stop              chan bool
 	healthCriticalXid map[uint64]bool
+	// This map is used for conditions setting and monitoring reason, will not trigger auto-repair
+	monitorCriticalXid map[uint64]bool
+	kubeClient         *kubernetes.Clientset
+	nodeName           string
+}
+
+func BuildKubeClient() (*kubernetes.Clientset, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		glog.Errorf("failed to get kube config. Error: %v", err)
+		return nil, err
+	}
+	config.ContentType = runtime.ContentTypeProtobuf
+
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		glog.Errorf("failed to get kube client. Error: %v", err)
+		return nil, err
+	}
+
+	return kubeClient, nil
 }
 
 // NewGPUHealthChecker returns a GPUHealthChecker object for a given device name
 func NewGPUHealthChecker(devices map[string]pluginapi.Device, health chan pluginapi.Device, codes []int) *GPUHealthChecker {
 	hc := &GPUHealthChecker{
-		devices:           make(map[string]pluginapi.Device),
-		nvmlDevices:       make(map[string]*nvml.Device),
-		health:            health,
-		stop:              make(chan bool),
-		healthCriticalXid: make(map[uint64]bool),
+		devices:            make(map[string]pluginapi.Device),
+		nvmlDevices:        make(map[string]*nvml.Device),
+		health:             health,
+		stop:               make(chan bool),
+		healthCriticalXid:  make(map[uint64]bool),
+		monitorCriticalXid: make(map[uint64]bool),
 	}
 
 	// Cloning the device map to avoid interfering with the device manager
@@ -55,13 +92,68 @@ func NewGPUHealthChecker(devices map[string]pluginapi.Device, health chan plugin
 		glog.Infof("reading code %v", c)
 		hc.healthCriticalXid[uint64(c)] = true
 	}
+	// TODO: extend ranges and record them in design doc
+	hc.monitorCriticalXid[48] = true
+	hc.monitorCriticalXid[79] = true
+	hc.monitorCriticalXid[140] = true
+	// TODO: remove the below Xid, temporarily added for test purpose
+	hc.monitorCriticalXid[31] = true
+	hc.monitorCriticalXid[45] = true
+
 	// By default, we check Double Bit ECC Error
 	hc.healthCriticalXid[48] = true
 	return hc
 }
 
+// Check whether the XID condition should be removed. If the conditions exists,
+// 1. If the bootId changes, consider the node fixed through auto-repair
+// 2. If the bootId stay unchanged, consider a pure gpu-device-plugin restart
+func (hc *GPUHealthChecker) resetXIDCondition() error {
+	node, err := hc.kubeClient.CoreV1().Nodes().Get(context.Background(), hc.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	bootId := node.Status.NodeInfo.BootID
+	lastBootId := ""
+	newConditions := []v1.NodeCondition{}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == XIDConditionType && condition.Status == "True" {
+			lastBootId = condition.Message
+			if bootId != "" && lastBootId != "" && bootId != lastBootId {
+				continue
+			}
+			newConditions = append(newConditions, condition)
+		}
+	}
+	// Remove condition
+	if len(newConditions) != len(node.Status.Conditions) {
+		node.Status.Conditions = newConditions
+		// TODO: Maybe use Patch to avoid conflicts? Not sure whether that is necessary
+		_, err := hc.kubeClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
+		if err != nil {
+			// Log the error, but proceed. The health checker might re-add the condition if the error persists.
+			glog.Errorf("Failed to update node %s status after removing XID condition: %v", hc.nodeName, err)
+		} else {
+			glog.Infof("Successfully removed XIDCriticalError condition from node %s.", hc.nodeName)
+		}
+	}
+	return nil
+}
+
 // Start registers NVML events and starts listening to them
 func (hc *GPUHealthChecker) Start() error {
+	hc.nodeName = os.Getenv("NODE_NAME")
+	if hc.nodeName == "" {
+		return fmt.Errorf("NODE_NAME environment variable not set")
+	}
+	kubeClient, err := BuildKubeClient()
+	if err != nil {
+		return err
+	}
+	hc.kubeClient = kubeClient
+	hc.resetXIDCondition()
+	hc.setXIDheartbeat()
+
 	glog.Info("Starting GPU Health Checker")
 
 	for name, device := range hc.devices {
@@ -176,12 +268,105 @@ func (gd *GPUDevice) parseMigDeviceUUID(UUID string) (string, uint, uint, error)
 	return nvml.ParseMigDeviceUUID(UUID)
 }
 
+func (hc *GPUHealthChecker) monitorXidevent(e nvml.Event) {
+	if _, ok := hc.monitorCriticalXid[e.Edata]; ok {
+		// Set XID condition
+		node, err := hc.kubeClient.CoreV1().Nodes().Get(context.Background(), hc.nodeName, metav1.GetOptions{})
+		if err != nil {
+			glog.Error("Failed to get node %s: %v", hc.nodeName, err)
+			return
+		}
+		found := false
+		skip := true
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == XIDConditionType {
+				found = true
+				skip = false
+				var genericMap map[string]interface{}
+				err := json.Unmarshal([]byte(condition.Reason), &genericMap)
+				if err != nil {
+					glog.Error("Can't decode the value of condition.Reason %s", condition.Reason)
+					return
+				}
+				xidStr := strconv.FormatUint(e.Edata, 10)
+				genericMap[xidStr] = true
+				jsonStr, err := json.Marshal(genericMap)
+				if err != nil {
+					glog.Error("Can't encode the value of condition.Reason %s", condition.Reason)
+					return
+				}
+				condition.Reason = string(jsonStr)
+			}
+		}
+		if !found {
+			genericMap := map[string]interface{}{strconv.FormatUint(e.Edata, 10): true}
+			jsonStr, err := json.Marshal(genericMap)
+			if err != nil {
+				glog.Error("Can't encode the value of genericMap %s", genericMap)
+				return
+			}
+			node.Status.Conditions = append(node.Status.Conditions, v1.NodeCondition{
+				Type:               XIDConditionType,
+				Status:             "True",
+				LastHeartbeatTime:  metav1.Now(),
+				LastTransitionTime: metav1.Now(),
+				Reason:             string(jsonStr),
+				Message:            node.Status.NodeInfo.BootID,
+			})
+		}
+		if !skip {
+			_, err := hc.kubeClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
+			if err != nil {
+				// Log the error, but proceed. The health checker might re-add the condition if the error persists.
+				glog.Errorf("Failed to update node %s status after removing XID condition: %v", hc.nodeName, err)
+			} else {
+				glog.Infof("Successfully removed XIDCriticalError condition from node %s.", hc.nodeName)
+			}
+		}
+	}
+	// TODO: Emit metric here
+}
+
+func (hc *GPUHealthChecker) setXIDheartbeat() {
+	for {
+		select {
+		case <-hc.stop:
+			return
+		default:
+			hc.updateLastHeartbeatTime()
+			time.Sleep(1 * time.Minute)
+		}
+	}
+}
+
+func (hc *GPUHealthChecker) updateLastHeartbeatTime() {
+	node, err := hc.kubeClient.CoreV1().Nodes().Get(context.Background(), hc.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return
+	}
+	newConditions := []v1.NodeCondition{}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == XIDConditionType && condition.Status == "True" {
+			condition.LastHeartbeatTime = metav1.Now()
+			newConditions = append(newConditions, condition)
+		}
+	}
+	_, err = hc.kubeClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
+	if err != nil {
+		// Log the error, but proceed. The health checker might re-add the condition if the error persists.
+		glog.Errorf("Failed to update node %s status after removing XID condition: %v", hc.nodeName, err)
+	}
+}
+
 func (hc *GPUHealthChecker) catchError(e nvml.Event, cd callDevice) {
 	// Skip the error if it's not Xid critical
 	if e.Etype != nvml.XidCriticalError {
 		glog.Infof("Skip error Xid=%d as it is not Xid Critical", e.Edata)
 		return
 	}
+
+	hc.monitorXidevent(e)
+
 	// Only marking device unhealthy on Double Bit ECC Error or customer-configured codes
 	// See https://docs.nvidia.com/deploy/xid-errors/index.html#topic_4
 	if _, ok := hc.healthCriticalXid[e.Edata]; !ok {
