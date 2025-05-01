@@ -241,3 +241,8 @@ func TestCatchError(t *testing.T) {
 		})
 	}
 }
+
+// This CL can be broken into 1. monitorXidevent 2. updateLastHeartbeatTime 3. resetXIDCondition
+// resetXIDCondition
+// updateLastHeartbeatTime
+// monitorXidevent
