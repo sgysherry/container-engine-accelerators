@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xid-trigger-pod
+spec:
+  restartPolicy: Never # Use Never or OnFailure for jobs/tests, Always for services
+  containers:
+  - name: xid-trigger-container
+    # This is the image you pushed
+    image: us-west1-docker.pkg.dev/yshangguan-gke-dev/sgy-test-image/xid-trigger@sha256:027351151346500dc2182ec0c4346e975ac0fd740d4c420874d0b4be27e4e8a4
+    resources:
+      limits:
+        # Request 1 GPU resource from the node
+        nvidia.com/gpu: "1"
+  nodeSelector:
+    # Ensure this pod lands on a node with the specified GPU type
+    # Common types: nvidia-tesla-t4, nvidia-tesla-k80, nvidia-tesla-v100, nvidia-a100
+    # Check your GKE node pool configuration for the correct label value
+    cloud.google.com/gke-accelerator: nvidia-tesla-p4
