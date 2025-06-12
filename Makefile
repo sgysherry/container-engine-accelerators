@@ -35,7 +35,7 @@ presubmit: vet
 	@./build/check_boilerplate.sh
 
 TAG=$(shell cat VERSION)
-REGISTRY?=gcr.io/google-containers
+REGISTRY?=us-west1-docker.pkg.dev/yshangguan-gke-dev/sgy-test-image
 IMAGE=nvidia-gpu-device-plugin
 PARTITION_GPU_IMAGE=nvidia-partition-gpu
 FASTSOCKET_INSTALLER_IMAGE=fastsocket-installer
