@@ -29,9 +29,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	client "k8s.io/client-go/kubernetes"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
@@ -52,29 +50,12 @@ type GPUHealthChecker struct {
 	healthCriticalXid map[uint64]bool
 	// This map is used for conditions setting and monitoring reason, will not trigger auto-repair
 	monitorCriticalXid map[uint64]bool
-	kubeClient         *kubernetes.Clientset
+	kubeClient         client.Interface
 	nodeName           string
 }
 
-func BuildKubeClient() (*kubernetes.Clientset, error) {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		glog.Errorf("failed to get kube config. Error: %v", err)
-		return nil, err
-	}
-	config.ContentType = runtime.ContentTypeProtobuf
-
-	kubeClient, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		glog.Errorf("failed to get kube client. Error: %v", err)
-		return nil, err
-	}
-
-	return kubeClient, nil
-}
-
 // NewGPUHealthChecker returns a GPUHealthChecker object for a given device name
-func NewGPUHealthChecker(devices map[string]pluginapi.Device, health chan pluginapi.Device, codes []int) *GPUHealthChecker {
+func NewGPUHealthChecker(devices map[string]pluginapi.Device, health chan pluginapi.Device, codes []int, kubeClient client.Interface) *GPUHealthChecker {
 	hc := &GPUHealthChecker{
 		devices:            make(map[string]pluginapi.Device),
 		nvmlDevices:        make(map[string]*nvml.Device),
@@ -83,6 +64,7 @@ func NewGPUHealthChecker(devices map[string]pluginapi.Device, health chan plugin
 		healthCriticalXid:  make(map[uint64]bool),
 		monitorCriticalXid: make(map[uint64]bool),
 	}
+	hc.kubeClient = kubeClient
 
 	// Cloning the device map to avoid interfering with the device manager
 	for id, d := range devices {
@@ -92,13 +74,11 @@ func NewGPUHealthChecker(devices map[string]pluginapi.Device, health chan plugin
 		glog.Infof("reading code %v", c)
 		hc.healthCriticalXid[uint64(c)] = true
 	}
-	// TODO: extend ranges and record them in design doc
-	hc.monitorCriticalXid[48] = true
-	hc.monitorCriticalXid[79] = true
-	hc.monitorCriticalXid[140] = true
-	// TODO: remove the below Xid, temporarily added for test purpose
-	hc.monitorCriticalXid[31] = true
-	hc.monitorCriticalXid[45] = true
+
+	monitorCriticalXid := []int{48, 63, 64, 79, 119, 120, 123, 140}
+	for _, xid := range monitorCriticalXid {
+		hc.monitorCriticalXid[uint64(xid)] = true
+	}
 
 	// By default, we check Double Bit ECC Error
 	hc.healthCriticalXid[48] = true
@@ -148,12 +128,7 @@ func (hc *GPUHealthChecker) Start() error {
 	if err != nil {
 		return err
 	}
-	kubeClient, err := BuildKubeClient()
-	if err != nil {
-		return err
-	}
 	hc.nodeName = nodeName
-	hc.kubeClient = kubeClient
 	err = hc.resetXIDCondition()
 	if err != nil {
 		return fmt.Errorf("failed to reset XID Condition %v", err)

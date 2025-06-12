@@ -15,12 +15,19 @@
 package healthcheck
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/gpu-monitoring-tools/bindings/go/nvml"
+
 	"k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func pointer[T any](s T) *T {
@@ -242,7 +249,165 @@ func TestCatchError(t *testing.T) {
 	}
 }
 
-// This CL can be broken into 1. monitorXidevent 2. updateLastHeartbeatTime 3. resetXIDCondition
-// resetXIDCondition
-// updateLastHeartbeatTime
-// monitorXidevent
+func TestUpdateLastHeartbeatTime(t *testing.T) {
+	node := makeNode(nil, nil)
+	initialTime := metav1.Now()
+	node.Status.Conditions = append(node.Status.Conditions, v1.NodeCondition{
+		Type:               XIDConditionType,
+		Status:             "True",
+		LastHeartbeatTime:  initialTime,
+		LastTransitionTime: initialTime,
+		Reason:             "XID",
+		Message:            node.Status.NodeInfo.BootID,
+	})
+	fakeClient := fake.NewSimpleClientset(&v1.NodeList{Items: []v1.Node{node}})
+
+	hc := NewGPUHealthChecker(nil, nil, nil, fakeClient)
+	hc.nodeName = "test-node"
+
+	time.Sleep(2 * time.Second)
+	hc.updateLastHeartbeatTime()
+	updatedNode, _ := fakeClient.CoreV1().Nodes().Get(context.Background(), "test-node", metav1.GetOptions{})
+	if updatedNode.Status.Conditions[0].LastHeartbeatTime == initialTime {
+		t.Errorf("The XID condition HeartbeatTime was not updated")
+	}
+}
+
+func TestResetXIDCondition(t *testing.T) {
+	// Initialize the node with condition
+	node := makeNode(nil, nil)
+	initialTime := metav1.Now()
+	node.Status.Conditions = append(node.Status.Conditions, v1.NodeCondition{
+		Type:               XIDConditionType,
+		Status:             "True",
+		LastHeartbeatTime:  initialTime,
+		LastTransitionTime: initialTime,
+		Reason:             "XID",
+		Message:            "0",
+	})
+	node.Status.NodeInfo.BootID = "0"
+	fakeClient := fake.NewSimpleClientset(&v1.NodeList{Items: []v1.Node{node}})
+
+	hc := NewGPUHealthChecker(nil, nil, nil, fakeClient)
+	hc.nodeName = "test-node"
+	// Try reset without rebootId changed, conditions remain the same
+	hc.resetXIDCondition()
+	updatedNode, _ := fakeClient.CoreV1().Nodes().Get(context.Background(), "test-node", metav1.GetOptions{})
+	if len(updatedNode.Status.Conditions) == 0 {
+		t.Errorf("The XID condition should persist without reboot")
+	}
+	// Try reset with rebootId changed, conditions get reset
+	updatedNode.Status.NodeInfo.BootID = "1"
+	_, err := fakeClient.CoreV1().Nodes().Update(context.Background(), updatedNode, metav1.UpdateOptions{})
+	if err != nil {
+		t.Errorf("Failed to update node: %v", err)
+	}
+	hc.resetXIDCondition()
+	updatedNode, _ = fakeClient.CoreV1().Nodes().Get(context.Background(), "test-node", metav1.GetOptions{})
+	if len(updatedNode.Status.Conditions) != 0 {
+		t.Errorf("The XID condition should be reset after reboot")
+	}
+}
+
+func TestMonitorXidevent(t *testing.T) {
+	for _, test := range []struct {
+		desc                     string
+		events                   []nvml.Event
+		expectedLength           int
+		expectedConditionType    v1.NodeConditionType
+		expectedConditionStatus  v1.ConditionStatus
+		expectedConditionReason  string
+		expectedConditionMessage string
+	}{
+		{
+			desc: "XID not in attention set",
+			events: []nvml.Event{
+				{
+					Edata: uint64(72),
+				},
+			},
+			expectedLength: 0,
+		},
+		{
+			desc: "XID all in attention set",
+			events: []nvml.Event{
+				{
+					Edata: uint64(79),
+				},
+				{
+					Edata: uint64(123),
+				},
+			},
+			expectedLength:           1,
+			expectedConditionType:    XIDConditionType,
+			expectedConditionStatus:  "True",
+			expectedConditionReason:  "{\"123\":true,\"79\":true}",
+			expectedConditionMessage: "123456",
+		},
+		{
+			desc: "XID partially in attention set",
+			events: []nvml.Event{
+				{
+					Edata: uint64(72),
+				},
+				{
+					Edata: uint64(140),
+				},
+			},
+			expectedLength:           1,
+			expectedConditionType:    XIDConditionType,
+			expectedConditionStatus:  "True",
+			expectedConditionReason:  "{\"140\":true}",
+			expectedConditionMessage: "123456",
+		},
+	} {
+		node := makeNode(nil, nil)
+		node.Status.NodeInfo.BootID = "123456"
+		fakeClient := fake.NewSimpleClientset(&v1.NodeList{Items: []v1.Node{node}})
+
+		hc := NewGPUHealthChecker(nil, nil, nil, fakeClient)
+		hc.nodeName = "test-node"
+
+		for _, event := range test.events {
+			hc.monitorXidevent(event)
+		}
+		updatedNode, _ := fakeClient.CoreV1().Nodes().Get(context.Background(), "test-node", metav1.GetOptions{})
+		if len(updatedNode.Status.Conditions) != test.expectedLength || len(updatedNode.Status.Conditions) > 1 {
+			t.Errorf("Expect condition length to have value %v, got %v", test.expectedLength, len(updatedNode.Status.Conditions))
+		}
+		if len(updatedNode.Status.Conditions) != 0 {
+			condition := updatedNode.Status.Conditions[0]
+			if condition.Type != test.expectedConditionType {
+				t.Errorf("Expect condition.Type to have value %v, got %v", test.expectedConditionType, condition.Type)
+			}
+			if condition.Status != test.expectedConditionStatus {
+				t.Errorf("Expect condition.Status to have value %v, got %v", test.expectedConditionStatus, condition.Status)
+			}
+			if condition.Reason != test.expectedConditionReason {
+				t.Errorf("Expect condition.Reason to have value %v, got %v", test.expectedConditionReason, condition.Reason)
+			}
+			if condition.Message != test.expectedConditionMessage {
+				t.Errorf("Expect condition.Message to have value %v, got %v", test.expectedConditionMessage, condition.Message)
+			}
+		}
+	}
+
+}
+
+func makeNode(labels map[string]string, annotations map[string]string) v1.Node {
+	metadata := metav1.ObjectMeta{
+		Name: "test-node",
+	}
+	if labels != nil {
+		metadata.Labels = labels
+	}
+	if annotations != nil {
+		metadata.Annotations = annotations
+	}
+	return v1.Node{
+		ObjectMeta: metadata,
+		Status: v1.NodeStatus{
+			Conditions: []v1.NodeCondition{},
+		},
+	}
+}
