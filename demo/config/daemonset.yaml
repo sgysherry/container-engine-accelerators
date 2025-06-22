@@ -55,7 +55,7 @@ spec:
           value: /usr/local/nvidia/lib64
         - name: GOMAXPROCS
           value: "1"
-        image: us-west1-docker.pkg.dev/yshangguan-gke-dev/sgy-test-image/nvidia-gpu-device-plugin@sha256:b66409943db5bd701c98a382c7516b0d5a40668a76bc82c137ffb99e60e746d4
+        image: us-west1-docker.pkg.dev/yshangguan-gke-dev/sgy-test-image/nvidia-gpu-device-plugin@sha256:8169f0453f47e156d8f921052c2f850d40ed89a4c7f56231905d141faaeae0a7
         imagePullPolicy: IfNotPresent
         name: nvidia-gpu-device-plugin
         ports:
@@ -98,11 +98,11 @@ spec:
         - name: SPLIT_GAUGE_BUFFER
           value: "true"
         - name: PROJECT_NUMBER
-          value: "1009477651638"
+          value: "744139846045"
         - name: LOCATION
           value: us-central1-c
         - name: CLUSTER_NAME
-          value: sgy-cluster
+          value: weitong-cluster
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -130,7 +130,7 @@ spec:
             fieldRef:
               apiVersion: v1
               fieldPath: metadata.annotations['components.gke.io/component-name']
-        image: us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20250217_2300_RC0@sha256:b78e39d6a9780ee6e86038727ce45839e6cb2519c836db9cf95cf951ea47ab70
+        image: us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20250519_2300_RC0@sha256:8eb5ca83cc3da9605c38ff5a839a9eb4123434ca631d715193bbdc8262bc3497
         imagePullPolicy: IfNotPresent
         name: nvidia-metrics-collector
         resources:
@@ -237,7 +237,7 @@ spec:
         env:
         - name: LD_LIBRARY_PATH
           value: /usr/local/nvidia/lib64
-        image: us-central1-artifactregistry.gcr.io/gke-release/gke-release/nvidia-partition-gpu:1.32.2-gke.0@sha256:d1a08283d9c61c16bb7c34b819954bafc33c03db910dd2314bedc9db99aae7be
+        image: us-central1-artifactregistry.gcr.io/gke-release/gke-release/nvidia-partition-gpu:1.32.4-gke.6@sha256:7ef573f6c76f891e4d9f835c7a1f0cbf1d9a2537b6e8c4a8449126c581784906
         imagePullPolicy: IfNotPresent
         name: partition-gpus
         resources:
